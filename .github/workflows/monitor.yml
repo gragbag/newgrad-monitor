@@ -1,0 +1,38 @@
+name: New Grad Job Monitor
+
+on:
+  schedule:
+    # Runs every 2 hours. Adjust the cron as you like (this is UTC).
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write  # needed so the workflow can commit the updated state.json
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "newgrad-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "Update seen postings [skip ci]"
+          git push
