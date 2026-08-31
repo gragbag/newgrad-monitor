@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manifest — New Grad Job Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --board:      #1B2027;
+    --board-2:    #232A33;
+    --board-3:    #2C3540;
+    --paper:      #EDE6D6;
+    --paper-dim:  #C9C2B2;
+    --ink:        #1B2027;
+    --amber:      #D9A441;
+    --amber-dim:  #8A6C2E;
+    --sage:       #5C8A6E;
+    --sage-dim:   #3E5F49;
+    --slate:      #8A93A0;
+    --slate-dim:  #565E68;
+    --rule:       #333C47;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--board);
+    color: var(--paper);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  h1, h2, .display {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+
+  a { color: inherit; }
+
+  /* ---------- layout ---------- */
+
+  .app {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    min-height: 100vh;
+  }
+
+  @media (max-width: 820px) {
+    .app { grid-template-columns: 1fr; }
+    .rail { position: static; border-right: none; border-bottom: 1px solid var(--rule); }
+  }
+
+  .rail {
+    background: var(--board-2);
+    border-right: 1px solid var(--rule);
+    padding: 28px 22px;
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    overflow-y: auto;
+  }
+
+  @media (max-width: 820px) { .rail { height: auto; } }
+
+  .rail h1 {
+    font-size: 22px;
+    margin: 0 0 2px 0;
+    color: var(--paper);
+  }
+
+  .rail .sub {
+    color: var(--slate);
+    font-size: 11.5px;
+    margin-bottom: 28px;
+  }
+
+  .filter-group { margin-bottom: 26px; }
+
+  .filter-group .label {
+    color: var(--slate);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 10px;
+  }
+
+  .search-input {
+    width: 100%;
+    background: var(--board);
+    border: 1px solid var(--rule);
+    color: var(--paper);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 3px;
+  }
+  .search-input:focus { outline: none; border-color: var(--amber-dim); }
+  .search-input::placeholder { color: var(--slate-dim); }
+
+  .chip-list { display: flex; flex-direction: column; gap: 6px; }
+
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    color: var(--slate);
+    font-size: 12.5px;
+    user-select: none;
+  }
+  .chip:hover { color: var(--paper); }
+  .chip input { accent-color: var(--amber); }
+  .chip .count { color: var(--slate-dim); margin-left: auto; font-size: 11px; }
+
+  select.search-input { appearance: none; }
+
+  .sync-box {
+    margin-top: 32px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+  }
+  .sync-status {
+    font-size: 11px;
+    color: var(--slate);
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .sync-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--slate-dim);
+    flex-shrink: 0;
+  }
+  .sync-dot.ok { background: var(--sage); }
+  .sync-dot.pending { background: var(--amber); }
+  .sync-dot.err { background: #B5544B; }
+
+  button {
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--slate);
+    padding: 6px 10px;
+    width: 100%;
+    margin-top: 6px;
+  }
+  .btn-ghost:hover { border-color: var(--slate); color: var(--paper); }
+
+  /* ---------- main ---------- */
+
+  .main { padding: 28px 32px 60px; }
+
+  .statbar {
+    display: flex;
+    gap: 32px;
+    margin-bottom: 30px;
+    flex-wrap: wrap;
+  }
+  .stat .num {
+    font-family: 'Fraunces', serif;
+    font-size: 32px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .stat .lbl {
+    color: var(--slate);
+    font-size: 11px;
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .stat.applied .num { color: var(--sage); }
+  .stat.remaining .num { color: var(--amber); }
+
+  .group { margin-bottom: 6px; }
+  .group-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 14px 4px 8px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 2px;
+    position: sticky;
+    top: 0;
+    background: var(--board);
+    z-index: 2;
+  }
+  .group-header .name {
+    font-family: 'Fraunces', serif;
+    font-size: 16px;
+  }
+  .group-header .n { color: var(--slate); font-size: 11.5px; }
+
+  .row {
+    display: grid;
+    grid-template-columns: 28px 1fr auto auto 90px;
+    gap: 14px;
+    align-items: center;
+    padding: 9px 4px;
+    border-bottom: 1px solid rgba(51,60,71,0.5);
+    transition: background 120ms ease;
+  }
+  .row:hover { background: var(--board-2); }
+  .row.applied { opacity: 0.55; }
+  .row.applied .role { text-decoration: line-through; text-decoration-color: var(--sage-dim); }
+  .row.closed:not(.applied) { opacity: 0.4; }
+
+  .closed-badge {
+    color: #B5544B;
+    border-color: #6B3530;
+    font-size: 10.5px;
+    white-space: nowrap;
+    padding: 2px 7px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 24px 1fr; row-gap: 4px; }
+    .row .location, .row .source, .row .date { grid-column: 2; font-size: 11px; }
+  }
+
+  .row input[type="checkbox"] {
+    width: 16px; height: 16px;
+    accent-color: var(--sage);
+    cursor: pointer;
+  }
+
+  .role-cell .company {
+    color: var(--paper);
+    font-weight: 500;
+  }
+  .role-cell .role { color: var(--paper-dim); font-size: 12.5px; }
+
+  .location { color: var(--slate); font-size: 11.5px; white-space: nowrap; }
+  .source {
+    color: var(--slate);
+    font-size: 10.5px;
+    white-space: nowrap;
+    padding: 2px 7px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+  .date { color: var(--slate-dim); font-size: 11px; white-space: nowrap; text-align: right; }
+
+  .apply-link {
+    color: var(--amber);
+    text-decoration: none;
+    border-bottom: 1px solid var(--amber-dim);
+  }
+  .apply-link:hover { border-bottom-color: var(--amber); }
+
+  .empty {
+    color: var(--slate);
+    padding: 60px 10px;
+    text-align: center;
+  }
+
+  .onboard {
+    max-width: 480px;
+    margin: 80px auto;
+    padding: 28px;
+    background: var(--board-2);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+  }
+  .onboard h2 { margin-top: 0; font-size: 18px; }
+  .onboard p { color: var(--slate); font-size: 12.5px; }
+  .onboard label { display: block; color: var(--slate); font-size: 11px; margin: 14px 0 5px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .onboard .btn-primary {
+    background: var(--amber);
+    color: var(--ink);
+    border: none;
+    padding: 9px 14px;
+    font-weight: 600;
+    margin-top: 18px;
+  }
+  .onboard .btn-primary:hover { background: #E8B65C; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="rail">
+    <h1>Manifest</h1>
+    <div class="sub">new grad job board</div>
+
+    <div class="filter-group">
+      <div class="label">Search</div>
+      <input class="search-input" id="search" placeholder="company or role…">
+    </div>
+
+    <div class="filter-group">
+      <div class="label">Status</div>
+      <div class="chip-list" id="statusFilters"></div>
+    </div>
+
+    <div class="filter-group">
+      <div class="label">Listing</div>
+      <div class="chip-list" id="listingFilters"></div>
+    </div>
+
+    <div class="filter-group">
+      <div class="label">Source</div>
+      <div class="chip-list" id="sourceFilters"></div>
+    </div>
+
+    <div class="filter-group">
+      <div class="label">Sort</div>
+      <select class="search-input" id="sortSelect">
+        <option value="newest">Newest first</option>
+        <option value="company">Company A–Z</option>
+      </select>
+    </div>
+
+    <div class="sync-box">
+      <div class="sync-status"><span class="sync-dot" id="syncDot"></span><span id="syncText">not connected</span></div>
+      <button class="btn-ghost" id="settingsBtn">GitHub sync settings</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="statbar">
+      <div class="stat"><div class="num" id="statTotal">–</div><div class="lbl">Tracked</div></div>
+      <div class="stat applied"><div class="num" id="statApplied">–</div><div class="lbl">Applied</div></div>
+      <div class="stat remaining"><div class="num" id="statRemaining">–</div><div class="lbl">Remaining</div></div>
+    </div>
+    <div id="board"></div>
+  </div>
+</div>
+
+<div class="onboard" id="onboardPanel" style="display:none;">
+  <h2>Connect GitHub sync</h2>
+  <p>Checkmarks are stored as <code>checkmarks.json</code> in your repo, so they follow you across devices. Create a fine-grained personal access token scoped to just this one repo, with read/write access to "Contents" only.</p>
+  <label>Repo owner</label>
+  <input class="search-input" id="cfgOwner" placeholder="e.g. julian">
+  <label>Repo name</label>
+  <input class="search-input" id="cfgRepo" placeholder="e.g. newgrad-monitor">
+  <label>Branch</label>
+  <input class="search-input" id="cfgBranch" placeholder="main" value="main">
+  <label>Personal access token</label>
+  <input class="search-input" id="cfgToken" type="password" placeholder="github_pat_…">
+  <button class="btn-primary" id="cfgSave">Save & connect</button>
+</div>
+
+<script>
+(function () {
+  const state = {
+    jobs: [],
+    checkmarks: {},        // link -> true
+    checkmarksSha: null,
+    cfg: JSON.parse(localStorage.getItem('manifest_cfg') || 'null'),
+    filters: { search: '', status: 'all', listing: 'open', sources: new Set(), sort: 'newest' },
+    saveTimer: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- data load ----------
+
+  async function loadJobs() {
+    try {
+      const res = await fetch('jobs.json', { cache: 'no-store' });
+      const data = await res.json();
+      state.jobs = data.jobs || [];
+    } catch (e) {
+      state.jobs = [];
+      console.error('Failed to load jobs.json', e);
+    }
+    render();
+  }
+
+  async function loadCheckmarks() {
+    if (!state.cfg) { setSync('pending', 'not connected'); return; }
+    setSync('pending', 'loading…');
+    try {
+      const url = `https://api.github.com/repos/${state.cfg.owner}/${state.cfg.repo}/contents/checkmarks.json?ref=${encodeURIComponent(state.cfg.branch)}`;
+      const res = await fetch(url, { headers: authHeaders() });
+      if (res.status === 404) {
+        state.checkmarks = {};
+        state.checkmarksSha = null;
+        setSync('ok', 'synced (new file)');
+        return;
+      }
+      if (!res.ok) throw new Error(`GitHub ${res.status}`);
+      const data = await res.json();
+      state.checkmarksSha = data.sha;
+      const decoded = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ''))));
+      state.checkmarks = JSON.parse(decoded || '{}');
+      setSync('ok', 'synced');
+    } catch (e) {
+      console.error('Failed to load checkmarks', e);
+      setSync('err', 'sync failed — check settings');
+    }
+    render();
+  }
+
+  function authHeaders() {
+    return {
+      'Authorization': `Bearer ${state.cfg.token}`,
+      'Accept': 'application/vnd.github+json',
+    };
+  }
+
+  function scheduleSave() {
+    setSync('pending', 'unsynced changes…');
+    clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(saveCheckmarks, 1800);
+  }
+
+  async function saveCheckmarks() {
+    if (!state.cfg) return;
+    setSync('pending', 'saving…');
+    try {
+      const body = {
+        message: `Update checkmarks (${Object.keys(state.checkmarks).length} applied)`,
+        content: btoa(unescape(encodeURIComponent(JSON.stringify(state.checkmarks, null, 2)))),
+        branch: state.cfg.branch,
+      };
+      if (state.checkmarksSha) body.sha = state.checkmarksSha;
+      const url = `https://api.github.com/repos/${state.cfg.owner}/${state.cfg.repo}/contents/checkmarks.json`;
+      const res = await fetch(url, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`GitHub ${res.status}`);
+      const data = await res.json();
+      state.checkmarksSha = data.content.sha;
+      setSync('ok', 'synced');
+    } catch (e) {
+      console.error('Failed to save checkmarks', e);
+      setSync('err', 'save failed — retry from settings');
+    }
+  }
+
+  function setSync(kind, text) {
+    $('syncDot').className = 'sync-dot ' + kind;
+    $('syncText').textContent = text;
+  }
+
+  // ---------- filters UI ----------
+
+  function sourceTypeLabel(t) {
+    return { tracker: 'Tracker', greenhouse: 'Greenhouse', lever: 'Lever', ashby: 'Ashby',
+      remoteok: 'RemoteOK', wwr: 'We Work Remotely', usajobs: 'USAJobs' }[t] || t;
+  }
+
+  function buildFilterChips() {
+    const statuses = [
+      ['all', 'All'], ['open', 'Not applied'], ['applied', 'Applied'],
+    ];
+    $('statusFilters').innerHTML = statuses.map(([val, label]) => `
+      <label class="chip">
+        <input type="radio" name="status" value="${val}" ${state.filters.status === val ? 'checked' : ''}>
+        ${label}
+      </label>`).join('');
+    $('statusFilters').querySelectorAll('input').forEach(inp =>
+      inp.addEventListener('change', () => { state.filters.status = inp.value; render(); }));
+
+    const listings = [
+      ['open', 'Open (+ applied)'], ['all', 'All'], ['closed', 'Closed only'],
+    ];
+    $('listingFilters').innerHTML = listings.map(([val, label]) => `
+      <label class="chip">
+        <input type="radio" name="listing" value="${val}" ${state.filters.listing === val ? 'checked' : ''}>
+        ${label}
+      </label>`).join('');
+    $('listingFilters').querySelectorAll('input').forEach(inp =>
+      inp.addEventListener('change', () => { state.filters.listing = inp.value; render(); }));
+
+    const types = [...new Set(state.jobs.map(j => j.source_type))].sort();
+    if (state.filters.sources.size === 0) types.forEach(t => state.filters.sources.add(t));
+    $('sourceFilters').innerHTML = types.map(t => {
+      const count = state.jobs.filter(j => j.source_type === t).length;
+      return `
+      <label class="chip">
+        <input type="checkbox" value="${t}" ${state.filters.sources.has(t) ? 'checked' : ''}>
+        ${sourceTypeLabel(t)}
+        <span class="count">${count}</span>
+      </label>`;
+    }).join('');
+    $('sourceFilters').querySelectorAll('input').forEach(inp =>
+      inp.addEventListener('change', () => {
+        if (inp.checked) state.filters.sources.add(inp.value);
+        else state.filters.sources.delete(inp.value);
+        render();
+      }));
+  }
+
+  $('search').addEventListener('input', (e) => { state.filters.search = e.target.value.toLowerCase(); render(); });
+  $('sortSelect').addEventListener('change', (e) => { state.filters.sort = e.target.value; render(); });
+
+  // ---------- render ----------
+
+  function render() {
+    buildFilterChips();
+
+    const f = state.filters;
+    let visible = state.jobs.filter(j => {
+      if (f.search && !(`${j.company} ${j.role}`.toLowerCase().includes(f.search))) return false;
+      if (f.sources.size && !f.sources.has(j.source_type)) return false;
+      const applied = !!state.checkmarks[j.link];
+      if (f.status === 'open' && applied) return false;
+      if (f.status === 'applied' && !applied) return false;
+      const closed = j.status === 'closed';
+      // "open" listing view still shows closed jobs you've already applied to,
+      // so applying doesn't make a posting disappear from your tracking view
+      if (f.listing === 'open' && closed && !applied) return false;
+      if (f.listing === 'closed' && !closed) return false;
+      return true;
+    });
+
+    if (f.sort === 'company') {
+      visible.sort((a, b) => a.company.localeCompare(b.company));
+    } else {
+      visible.sort((a, b) => new Date(b.first_seen) - new Date(a.first_seen));
+    }
+
+    const openJobs = state.jobs.filter(j => j.status !== 'closed');
+    const appliedCount = state.jobs.filter(j => state.checkmarks[j.link]).length;
+    $('statTotal').textContent = openJobs.length;
+    $('statApplied').textContent = appliedCount;
+    $('statRemaining').textContent = openJobs.filter(j => !state.checkmarks[j.link]).length;
+
+    if (!visible.length) {
+      $('board').innerHTML = '<div class="empty">Nothing matches these filters.</div>';
+      return;
+    }
+
+    // group by company when sorted by company, otherwise one flat list under "Latest"
+    let html = '';
+    if (f.sort === 'company') {
+      let currentCompany = null;
+      for (const j of visible) {
+        if (j.company !== currentCompany) {
+          currentCompany = j.company;
+          html += `<div class="group-header"><span class="name">${escapeHtml(j.company)}</span></div>`;
+        }
+        html += rowHtml(j);
+      }
+    } else {
+      html += `<div class="group-header"><span class="name">Latest</span><span class="n">${visible.length}</span></div>`;
+      html += visible.map(rowHtml).join('');
+    }
+    $('board').innerHTML = html;
+
+    $('board').querySelectorAll('input[type="checkbox"][data-link]').forEach(cb => {
+      cb.addEventListener('change', () => {
+        const link = cb.getAttribute('data-link');
+        if (cb.checked) state.checkmarks[link] = true;
+        else delete state.checkmarks[link];
+        render();
+        scheduleSave();
+      });
+    });
+  }
+
+  function rowHtml(j) {
+    const applied = !!state.checkmarks[j.link];
+    const closed = j.status === 'closed';
+    const date = j.first_seen ? new Date(j.first_seen).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '';
+    return `
+      <div class="row ${applied ? 'applied' : ''} ${closed ? 'closed' : ''}">
+        <input type="checkbox" data-link="${escapeAttr(j.link)}" ${applied ? 'checked' : ''}>
+        <div class="role-cell">
+          <a class="apply-link" href="${escapeAttr(j.link)}" target="_blank" rel="noopener">
+            <span class="company">${escapeHtml(j.company)}</span> — <span class="role">${escapeHtml(j.role)}</span>
+          </a>
+          ${closed ? '<span class="closed-badge">closed</span>' : ''}
+        </div>
+        <div class="location">${escapeHtml(j.location || '')}</div>
+        <div class="source">${sourceTypeLabel(j.source_type)}</div>
+        <div class="date">${date}</div>
+      </div>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  // ---------- settings ----------
+
+  $('settingsBtn').addEventListener('click', () => {
+    if (state.cfg) {
+      $('cfgOwner').value = state.cfg.owner;
+      $('cfgRepo').value = state.cfg.repo;
+      $('cfgBranch').value = state.cfg.branch;
+      $('cfgToken').value = state.cfg.token;
+    }
+    $('onboardPanel').style.display = 'block';
+    $('onboardPanel').scrollIntoView({ behavior: 'smooth' });
+  });
+
+  $('cfgSave').addEventListener('click', async () => {
+    const owner = $('cfgOwner').value.trim();
+    const repo = $('cfgRepo').value.trim();
+    const branch = $('cfgBranch').value.trim() || 'main';
+    const token = $('cfgToken').value.trim();
+    if (!owner || !repo || !token) { alert('Owner, repo, and token are all required.'); return; }
+    state.cfg = { owner, repo, branch, token };
+    localStorage.setItem('manifest_cfg', JSON.stringify(state.cfg));
+    $('onboardPanel').style.display = 'none';
+    await loadCheckmarks();
+  });
+
+  // ---------- boot ----------
+
+  loadJobs();
+  loadCheckmarks();
+})();
+</script>
+
+</body>
+</html>

@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
-  contents: write  # needed so the workflow can commit the updated state.json
+  contents: write  # needed so the workflow can commit the updated jobs.json
 
 jobs:
   check-jobs:
@@ -26,13 +26,14 @@ jobs:
 
       - name: Run monitor
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          USAJOBS_API_KEY: ${{ secrets.USAJOBS_API_KEY }}
+          USAJOBS_EMAIL: ${{ secrets.USAJOBS_EMAIL }}
         run: python monitor.py
 
-      - name: Commit updated state
+      - name: Commit updated jobs.json
         run: |
           git config user.name "newgrad-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state.json
-          git diff --quiet --cached || git commit -m "Update seen postings [skip ci]"
+          git add jobs.json
+          git diff --quiet --cached || git commit -m "Update jobs.json [skip ci]"
           git push

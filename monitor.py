@@ -11,21 +11,27 @@ Pulls new-grad job postings from a variety of source *types*:
   - wwr_rss        : weworkremotely.com RSS feed
   - usajobs        : USAJobs.gov API (requires a free API key)
 
-Diffs against previously-seen postings (state.json) and pushes new ones to Discord.
+Writes jobs.json: a full, browsable snapshot of every posting ever seen, with
+company/role/location/source/category/status/first_seen/last_seen/closed_at —
+this is the file the frontend (index.html) reads to render the board. Postings
+that drop out of a source's current listing are marked "closed" (not deleted)
+so applied-to jobs don't vanish from your board; closed postings you never
+applied to are pruned after CLOSED_RETENTION_DAYS.
 """
 
 import json
 import os
 import re
 import sys
-import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 
-STATE_FILE = "state.json"
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+JOBS_FILE = "jobs.json"  # full browsable dataset, read by index.html
+CHECKMARKS_FILE = "checkmarks.json"  # written by index.html; read here so applied jobs are never pruned
+CLOSED_RETENTION_DAYS = 45  # how long a closed, never-applied posting stays visible before being dropped
 USAJOBS_API_KEY = os.environ.get("USAJOBS_API_KEY", "")
 USAJOBS_EMAIL = os.environ.get("USAJOBS_EMAIL", "")  # USAJobs wants your email as the User-Agent
 
@@ -50,18 +56,39 @@ GREENHOUSE_COMPANIES = [
 LEVER_COMPANIES = ["box", "eventbrite", "attentive"]
 ASHBY_COMPANIES = ["ramp", "linear", "openai", "anthropic", "vanta", "mercury", "retool"]
 
-# Keyword signals used to filter the ATS/aggregator feeds (which list ALL roles,
+# Regex signals used to filter the ATS/aggregator feeds (which list ALL roles,
 # not just new-grad ones) down to new-grad-relevant postings. This is inherently
-# imperfect — company title conventions vary — so tune this list to taste.
-NEW_GRAD_TITLE_KEYWORDS = [
-    "new grad", "university grad", "college grad", "early career",
-    "entry level", "entry-level", "associate software engineer",
-    "software engineer i", "software engineer 1", "swe i", "swe 1",
-    "graduate software", "recent graduate",
+# imperfect — company title conventions vary — so tune these to taste.
+#
+# Matched with \b word boundaries (not substrings) so e.g. "software engineer i"
+# does NOT match inside "software engineer ii" — the naive substring check this
+# replaced had exactly that bug, silently letting mid-level roles through.
+NEW_GRAD_PATTERNS = [
+    r"new\s*grad", r"university\s*grad", r"college\s*grad", r"recent\s*grad",
+    r"class\s+of\s+20(2[4-9]|3[0-9])",       # "Class of 2026", etc.
+    r"campus\s+(hire|hiring|recruit)",
+    r"early[\s-]?career", r"entry[\s-]?level",
+    r"associate\s+software\s+engineer",
+    r"junior\s+(software\s+)?(engineer|developer)",
+    r"graduate\s+software",
+    r"software\s+(engineer|developer)\s*,?\s*[i1]\b",   # "Software Engineer I" / "... 1"
+    r"\bswe\s*[i1]\b",
 ]
 
-# Applies on top of the new-grad keyword match above, to the same role text.
-EXCLUDE_KEYWORDS = ["intern", "senior", "staff", "principal", "manager", "director"]
+# Applies on top of the new-grad match above, to the same role text — rules out
+# internships/co-ops (not full-time new-grad roles) and anything mid+ level.
+EXCLUDE_PATTERNS = [
+    r"\bintern(ship)?\b", r"\bco[\s-]?op\b",
+    r"\bsenior\b", r"\bsr\.?\b", r"\bstaff\b", r"\bprincipal\b", r"\blead\b",
+    r"\bmanager\b", r"\bdirector\b", r"\bvp\b", r"\bvice\s+president\b", r"\bhead\s+of\b",
+    r"\bmid\b", r"\bexperienced\b",         # "\bmid\b" also covers "mid-level" / "mid level"
+    r"(engineer|developer|scientist|analyst)\s*,?\s*(ii|iii|iv|v)\b",  # "... II/III/IV/V"
+    r"(engineer|developer|scientist|analyst)\s*,?\s*[2-9]\b",          # "... 2", "... 3", ...
+    r"\b[2-9]\+?\s*years?\b",               # "3+ years" mentioned in the title
+]
+
+NEW_GRAD_RE = re.compile("|".join(NEW_GRAD_PATTERNS), re.IGNORECASE)
+EXCLUDE_RE = re.compile("|".join(EXCLUDE_PATTERNS), re.IGNORECASE)
 
 # GitHub tracker repos (existing behavior) — general markdown-table sources
 GITHUB_TABLE_SOURCES = [
@@ -107,10 +134,9 @@ def normalize_link(url: str) -> str:
 
 
 def matches_new_grad(role: str) -> bool:
-    role_lower = role.lower()
-    if any(kw in role_lower for kw in EXCLUDE_KEYWORDS):
+    if EXCLUDE_RE.search(role):
         return False
-    return any(kw in role_lower for kw in NEW_GRAD_TITLE_KEYWORDS)
+    return bool(NEW_GRAD_RE.search(role))
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +144,15 @@ def matches_new_grad(role: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def fetch_github_table(source):
+    """Returns a list of jobs, or None if the fetch itself failed (as opposed
+    to succeeding with zero matches) — callers use None to skip stale-closing
+    postings for this source on a transient error rather than closing all of them."""
     try:
         resp = requests.get(source["url"], headers=HEADERS, timeout=20)
         resp.raise_for_status()
     except Exception as e:
         print(f"[warn] {source['name']}: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for line in resp.text.splitlines():
@@ -146,8 +175,12 @@ def fetch_github_table(source):
         location = clean_cell(cells[2]) if len(cells) > 2 else ""
         if not company or company.lower() == "company":
             continue
-        if "intern" in role.lower():
-            continue  # these trackers are curated new-grad lists; just drop internships
+        # These trackers are curated new-grad lists, so we don't require a
+        # NEW_GRAD_RE match (many legit rows are just "Software Engineer" with
+        # no "new grad" wording) — but mid/senior/staff/leveled roles do slip
+        # through some of these lists, so still run the exclude filter.
+        if EXCLUDE_RE.search(role):
+            continue
         jobs.append({
             "company": company, "role": role, "location": location,
             "link": normalize_link(link),
@@ -160,12 +193,15 @@ def fetch_greenhouse(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         if resp.status_code == 404:
-            return []
+            # slug is wrong or the company migrated ATS — a standing condition, not
+            # "zero jobs right now", so don't let this close out its prior postings
+            print(f"[warn] greenhouse/{slug}: 404 (bad slug or migrated ATS)", file=sys.stderr)
+            return None
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         print(f"[warn] greenhouse/{slug}: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for j in data.get("jobs", []):
@@ -186,12 +222,13 @@ def fetch_lever(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         if resp.status_code == 404:
-            return []
+            print(f"[warn] lever/{slug}: 404 (bad slug or migrated ATS)", file=sys.stderr)
+            return None
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         print(f"[warn] lever/{slug}: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for j in data:
@@ -213,12 +250,13 @@ def fetch_ashby(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         if resp.status_code == 404:
-            return []
+            print(f"[warn] ashby/{slug}: 404 (bad slug or migrated ATS)", file=sys.stderr)
+            return None
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         print(f"[warn] ashby/{slug}: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for j in data.get("jobs", []):
@@ -242,7 +280,7 @@ def fetch_remoteok():
         data = resp.json()
     except Exception as e:
         print(f"[warn] remoteok: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for j in data:
@@ -268,7 +306,7 @@ def fetch_wwr_rss():
         root = ET.fromstring(resp.content)
     except Exception as e:
         print(f"[warn] weworkremotely: fetch failed: {e}", file=sys.stderr)
-        return []
+        return None
 
     jobs = []
     for item in root.iter("item"):
@@ -306,7 +344,8 @@ def fetch_usajobs():
             data = resp.json()
         except Exception as e:
             print(f"[warn] usajobs ({kw}): fetch failed: {e}", file=sys.stderr)
-            continue
+            # bail out entirely rather than closing postings based on partial results
+            return None
         for item in data.get("SearchResult", {}).get("SearchResultItems", []):
             d = item.get("MatchedObjectDescriptor", {})
             role = d.get("PositionTitle", "")
@@ -322,41 +361,40 @@ def fetch_usajobs():
 
 
 # ---------------------------------------------------------------------------
-# State + Discord
+# State
 # ---------------------------------------------------------------------------
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"seen_links": []}
+def load_jobs():
+    """Returns dict of {link: job_record}. job_record has company, role,
+    location, link, source, source_type, category, status ("open"/"closed"),
+    closed_at, first_seen, last_seen (ISO8601 UTC)."""
+    if os.path.exists(JOBS_FILE):
+        with open(JOBS_FILE, "r") as f:
+            data = json.load(f)
+            return {j["link"]: j for j in data.get("jobs", [])}
+    return {}
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def load_checkmarks():
+    """Returns the set of links marked applied in checkmarks.json (written by
+    index.html), so pruning never deletes a job the user has applied to."""
+    if os.path.exists(CHECKMARKS_FILE):
+        try:
+            with open(CHECKMARKS_FILE, "r") as f:
+                return set(json.load(f).keys())
+        except Exception:
+            return set()
+    return set()
 
 
-def post_to_discord(new_jobs, source_name):
-    if not DISCORD_WEBHOOK_URL:
-        print("[warn] DISCORD_WEBHOOK_URL not set, skipping Discord post")
-        return
-    for i in range(0, len(new_jobs), 10):
-        batch = new_jobs[i:i + 10]
-        embeds = [{
-            "title": f"{job['company']} — {job['role']}"[:256],
-            "url": job["link"],
-            "description": job["location"] or "Location not listed",
-        } for job in batch]
-        payload = {
-            "content": f"**{len(new_jobs)} new posting(s)** from *{source_name}*" if i == 0 else None,
-            "embeds": embeds,
-        }
-        payload = {k: v for k, v in payload.items() if v is not None}
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-        if resp.status_code >= 300:
-            print(f"[warn] discord post failed: {resp.status_code} {resp.text}", file=sys.stderr)
-        time.sleep(1)
+def save_jobs(jobs_by_link):
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(jobs_by_link),
+        "jobs": sorted(jobs_by_link.values(), key=lambda j: j["first_seen"], reverse=True),
+    }
+    with open(JOBS_FILE, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -364,53 +402,111 @@ def post_to_discord(new_jobs, source_name):
 # ---------------------------------------------------------------------------
 
 def build_sources():
-    """Returns list of (name, fetch_fn) pairs."""
+    """Returns list of (name, source_type, category, fetch_fn) tuples.
+    source_type/category are metadata tags carried into jobs.json for the
+    frontend's filters — not used for fetching logic itself."""
     sources = []
     for s in GITHUB_TABLE_SOURCES:
-        sources.append((s["name"], lambda s=s: fetch_github_table(s)))
+        sources.append((s["name"], "tracker", "New Grad", lambda s=s: fetch_github_table(s)))
     for slug in GREENHOUSE_COMPANIES:
-        sources.append((f"Greenhouse/{slug}", lambda slug=slug: fetch_greenhouse(slug)))
+        sources.append((f"Greenhouse/{slug}", "greenhouse", "New Grad", lambda slug=slug: fetch_greenhouse(slug)))
     for slug in LEVER_COMPANIES:
-        sources.append((f"Lever/{slug}", lambda slug=slug: fetch_lever(slug)))
+        sources.append((f"Lever/{slug}", "lever", "New Grad", lambda slug=slug: fetch_lever(slug)))
     for slug in ASHBY_COMPANIES:
-        sources.append((f"Ashby/{slug}", lambda slug=slug: fetch_ashby(slug)))
-    sources.append(("RemoteOK", fetch_remoteok))
-    sources.append(("We Work Remotely", fetch_wwr_rss))
+        sources.append((f"Ashby/{slug}", "ashby", "New Grad", lambda slug=slug: fetch_ashby(slug)))
+    sources.append(("RemoteOK", "remoteok", "New Grad", fetch_remoteok))
+    sources.append(("We Work Remotely", "wwr", "New Grad", fetch_wwr_rss))
     if USAJOBS_API_KEY:
-        sources.append(("USAJobs", fetch_usajobs))
+        sources.append(("USAJobs", "usajobs", "New Grad", fetch_usajobs))
     return sources
 
 
 def main():
-    state = load_state()
-    seen = set(state.get("seen_links", []))
-    is_first_run = len(seen) == 0
+    jobs_by_link = load_jobs()
+    applied_links = load_checkmarks()
+    is_first_run = len(jobs_by_link) == 0
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    all_new = []
-    for name, fetch_fn in build_sources():
-        jobs = fetch_fn()
-        new_jobs = [j for j in jobs if j["link"] and j["link"] not in seen]
-        for j in new_jobs:
-            seen.add(j["link"])
+    total_new = total_closed = total_reopened = 0
 
-        if is_first_run:
-            print(f"[init] baseline: recorded {len(new_jobs)} existing postings from {name}")
+    for name, source_type, category, fetch_fn in build_sources():
+        fetched = fetch_fn()
+
+        if fetched is None:
+            print(f"[warn] {name}: fetch failed, leaving its existing postings untouched")
             continue
 
-        if new_jobs:
-            print(f"[info] {len(new_jobs)} new posting(s) from {name}")
-            post_to_discord(new_jobs, name)
-            all_new.extend(new_jobs)
-        else:
-            print(f"[info] no new postings from {name}")
+        current_links = {j["link"] for j in fetched if j["link"]}
 
-    state["seen_links"] = sorted(seen)
-    save_state(state)
+        new_count = reopened_count = 0
+        for j in fetched:
+            if not j["link"]:
+                continue
+            existing = jobs_by_link.get(j["link"])
+            if existing is None:
+                jobs_by_link[j["link"]] = {
+                    **j,
+                    "source": name,
+                    "source_type": source_type,
+                    "category": category,
+                    "status": "open",
+                    "closed_at": None,
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                }
+                new_count += 1
+            else:
+                existing["last_seen"] = now_iso
+                was_closed = existing.get("status") == "closed"
+                if existing.get("status") != "open":
+                    # covers both reopening a closed posting and backfilling
+                    # "status" on records written before this field existed
+                    existing["status"] = "open"
+                    existing["closed_at"] = None
+                    if was_closed:
+                        reopened_count += 1
+
+        closed_count = 0
+        if not is_first_run:
+            for job in jobs_by_link.values():
+                if (job.get("source") == name and job.get("status", "open") == "open"
+                        and job["link"] not in current_links):
+                    job["status"] = "closed"
+                    job["closed_at"] = now_iso
+                    closed_count += 1
+
+        total_new += new_count
+        total_closed += closed_count
+        total_reopened += reopened_count
+
+        if is_first_run:
+            print(f"[init] baseline: recorded {len(current_links)} existing postings from {name}")
+        elif new_count or closed_count or reopened_count:
+            print(f"[info] {name}: {new_count} new, {closed_count} closed, {reopened_count} reopened")
+        else:
+            print(f"[info] {name}: no changes")
+
+    # Drop postings that have been closed for a while and were never applied to,
+    # so jobs.json doesn't grow forever. Anything in checkmarks.json is kept regardless.
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - CLOSED_RETENTION_DAYS * 86400
+    stale_links = [
+        link for link, job in jobs_by_link.items()
+        if job.get("status") == "closed"
+        and job.get("closed_at")
+        and datetime.fromisoformat(job["closed_at"]).timestamp() < cutoff_ts
+        and link not in applied_links
+    ]
+    for link in stale_links:
+        del jobs_by_link[link]
+
+    save_jobs(jobs_by_link)
 
     if is_first_run:
-        print("Baseline established. Future runs will report only new postings.")
+        print("Baseline established. Future runs will report new postings, closures, and reopenings.")
     else:
-        print(f"Done. {len(all_new)} total new posting(s) this run.")
+        print(f"Done. {total_new} new, {total_closed} newly closed, {total_reopened} reopened, "
+              f"{len(stale_links)} pruned (closed >{CLOSED_RETENTION_DAYS}d, never applied). "
+              f"{len(jobs_by_link)} total tracked.")
 
 
 if __name__ == "__main__":
