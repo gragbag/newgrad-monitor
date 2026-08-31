@@ -2,11 +2,16 @@
 """
 New Grad Job Monitor
 ---------------------
-Fetches new-grad job listings from a set of community-maintained GitHub repos,
-diffs against previously-seen postings, and pushes new ones to a Discord webhook.
+Pulls new-grad job postings from a variety of source *types*:
+  - github_table   : community trackers (markdown tables) on GitHub
+  - greenhouse     : direct company ATS API (boards-api.greenhouse.io)
+  - lever          : direct company ATS API (api.lever.co)
+  - ashby          : direct company ATS API (api.ashbyhq.com)
+  - remoteok       : remoteok.com public JSON API
+  - wwr_rss        : weworkremotely.com RSS feed
+  - usajobs        : USAJobs.gov API (requires a free API key)
 
-State is stored in state.json (committed back to the repo by the GitHub Action)
-so the diff persists across runs.
+Diffs against previously-seen postings (state.json) and pushes new ones to Discord.
 """
 
 import json
@@ -14,16 +19,52 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 
 STATE_FILE = "state.json"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+USAJOBS_API_KEY = os.environ.get("USAJOBS_API_KEY", "")
+USAJOBS_EMAIL = os.environ.get("USAJOBS_EMAIL", "")  # USAJobs wants your email as the User-Agent
 
-# Each source is a raw.githubusercontent.com markdown file containing a
-# "| Company | Role | Location | ... | <a href=...>Apply</a> | ... |" style table.
-SOURCES = [
+HEADERS = {"User-Agent": "newgrad-job-monitor/1.0 (personal use)"}
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit these to tune what you get
+# ---------------------------------------------------------------------------
+
+# Direct-ATS companies to check. Find a company's slug from its careers URL:
+#   Greenhouse: boards.greenhouse.io/<slug>       -> greenhouse
+#   Lever:      jobs.lever.co/<slug>               -> lever
+#   Ashby:      jobs.ashbyhq.com/<slug>            -> ashby
+# Slugs occasionally change or a company migrates ATS — a 404 for one company
+# is skipped silently (see fetch_greenhouse/lever/ashby below).
+GREENHOUSE_COMPANIES = [
+    "stripe", "doordash", "coinbase", "robinhood", "brex", "plaid", "discord",
+    "figma", "notion", "airtable", "twilio", "cloudflare", "databricks",
+    "gitlab", "dropbox", "pinterest", "reddit", "instacart", "lyft", "asana",
+    "samsara", "confluent", "snowflake", "gusto", "affirm",
+]
+LEVER_COMPANIES = ["box", "eventbrite", "attentive"]
+ASHBY_COMPANIES = ["ramp", "linear", "openai", "anthropic", "vanta", "mercury", "retool"]
+
+# Keyword signals used to filter the ATS/aggregator feeds (which list ALL roles,
+# not just new-grad ones) down to new-grad-relevant postings. This is inherently
+# imperfect — company title conventions vary — so tune this list to taste.
+NEW_GRAD_TITLE_KEYWORDS = [
+    "new grad", "university grad", "college grad", "early career",
+    "entry level", "entry-level", "associate software engineer",
+    "software engineer i", "software engineer 1", "swe i", "swe 1",
+    "graduate software", "recent graduate",
+]
+
+# Applies on top of the new-grad keyword match above, to the same role text.
+EXCLUDE_KEYWORDS = ["intern", "senior", "staff", "principal", "manager", "director"]
+
+# GitHub tracker repos (existing behavior) — general markdown-table sources
+GITHUB_TABLE_SOURCES = [
     {
         "name": "New-Grad-2027 (vanshb03)",
         "url": "https://raw.githubusercontent.com/vanshb03/New-Grad-2027/dev/README.md",
@@ -38,16 +79,15 @@ SOURCES = [
     },
 ]
 
-# Optional filters. Leave empty to get everything.
-# INCLUDE_KEYWORDS: if non-empty, role text must contain at least one (case-insensitive)
-# EXCLUDE_KEYWORDS: role text must NOT contain any of these
-INCLUDE_KEYWORDS = []  # e.g. ["software engineer", "backend", "swe"]
-EXCLUDE_KEYWORDS = ["intern"]  # skip internship rows, keep new-grad/full-time only
+# USAJobs search params (only used if USAJOBS_API_KEY is set)
+USAJOBS_KEYWORDS = ["software engineer", "computer scientist"]
 
-ROW_RE = re.compile(r"^\|(.+)\|\s*$", re.MULTILINE)
-# Matches either an HTML href="..." link or a markdown [text](url) link
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
 LINK_RE = re.compile(r'href="([^"]+)"|\]\((https?://[^)\s]+)\)')
-BOLD_STRIP_RE = re.compile(r"\*\*|<[^>]+>")  # strip markdown bold + any stray html tags
+BOLD_STRIP_RE = re.compile(r"\*\*|<[^>]+>")
 
 
 def clean_cell(cell: str) -> str:
@@ -66,18 +106,33 @@ def normalize_link(url: str) -> str:
         return url
 
 
-def parse_table(markdown: str):
-    """Yield dicts of {company, role, location, link} from any markdown table
-    that has a Company-like first column and an <a href> apply link somewhere in the row."""
+def matches_new_grad(role: str) -> bool:
+    role_lower = role.lower()
+    if any(kw in role_lower for kw in EXCLUDE_KEYWORDS):
+        return False
+    return any(kw in role_lower for kw in NEW_GRAD_TITLE_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Source fetchers — each returns a list of {company, role, location, link}
+# ---------------------------------------------------------------------------
+
+def fetch_github_table(source):
+    try:
+        resp = requests.get(source["url"], headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[warn] {source['name']}: fetch failed: {e}", file=sys.stderr)
+        return []
+
     jobs = []
-    for line in markdown.splitlines():
+    for line in resp.text.splitlines():
         line = line.strip()
         if not line.startswith("|") or "---" in line:
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
         if len(cells) < 3:
             continue
-        # find the cell containing an apply link
         link = None
         for c in cells:
             m = LINK_RE.search(c)
@@ -91,33 +146,184 @@ def parse_table(markdown: str):
         location = clean_cell(cells[2]) if len(cells) > 2 else ""
         if not company or company.lower() == "company":
             continue
+        if "intern" in role.lower():
+            continue  # these trackers are curated new-grad lists; just drop internships
         jobs.append({
-            "company": company,
-            "role": role,
-            "location": location,
+            "company": company, "role": role, "location": location,
             "link": normalize_link(link),
         })
     return jobs
 
 
-def passes_filters(job) -> bool:
-    role_lower = job["role"].lower()
-    if EXCLUDE_KEYWORDS and any(kw.lower() in role_lower for kw in EXCLUDE_KEYWORDS):
-        return False
-    if INCLUDE_KEYWORDS and not any(kw.lower() in role_lower for kw in INCLUDE_KEYWORDS):
-        return False
-    return True
-
-
-def fetch_source(source):
+def fetch_greenhouse(slug):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
     try:
-        resp = requests.get(source["url"], timeout=20)
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code == 404:
+            return []
         resp.raise_for_status()
-        return parse_table(resp.text)
+        data = resp.json()
     except Exception as e:
-        print(f"[warn] failed to fetch {source['name']}: {e}", file=sys.stderr)
+        print(f"[warn] greenhouse/{slug}: fetch failed: {e}", file=sys.stderr)
         return []
 
+    jobs = []
+    for j in data.get("jobs", []):
+        role = j.get("title", "")
+        if not matches_new_grad(role):
+            continue
+        jobs.append({
+            "company": slug.capitalize(),
+            "role": role,
+            "location": (j.get("location") or {}).get("name", ""),
+            "link": normalize_link(j.get("absolute_url", "")),
+        })
+    return jobs
+
+
+def fetch_lever(slug):
+    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[warn] lever/{slug}: fetch failed: {e}", file=sys.stderr)
+        return []
+
+    jobs = []
+    for j in data:
+        role = j.get("text", "")
+        if not matches_new_grad(role):
+            continue
+        categories = j.get("categories", {}) or {}
+        jobs.append({
+            "company": slug.capitalize(),
+            "role": role,
+            "location": categories.get("location", ""),
+            "link": normalize_link(j.get("hostedUrl", "")),
+        })
+    return jobs
+
+
+def fetch_ashby(slug):
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[warn] ashby/{slug}: fetch failed: {e}", file=sys.stderr)
+        return []
+
+    jobs = []
+    for j in data.get("jobs", []):
+        role = j.get("title", "")
+        if not matches_new_grad(role):
+            continue
+        jobs.append({
+            "company": slug.capitalize(),
+            "role": role,
+            "location": j.get("location", ""),
+            "link": normalize_link(j.get("jobUrl", "") or j.get("applyUrl", "")),
+        })
+    return jobs
+
+
+def fetch_remoteok():
+    url = "https://remoteok.com/api"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[warn] remoteok: fetch failed: {e}", file=sys.stderr)
+        return []
+
+    jobs = []
+    for j in data:
+        if not isinstance(j, dict) or "position" not in j:
+            continue  # first element is a metadata/legal blob, not a job
+        role = j.get("position", "")
+        if not matches_new_grad(role):
+            continue
+        jobs.append({
+            "company": j.get("company", ""),
+            "role": role,
+            "location": j.get("location", "Remote"),
+            "link": normalize_link(j.get("url", "")),
+        })
+    return jobs
+
+
+def fetch_wwr_rss():
+    url = "https://weworkremotely.com/categories/remote-programming-jobs.rss"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        print(f"[warn] weworkremotely: fetch failed: {e}", file=sys.stderr)
+        return []
+
+    jobs = []
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not matches_new_grad(title):
+            continue
+        # WWR titles are usually "Company: Role"
+        if ":" in title:
+            company, role = title.split(":", 1)
+        else:
+            company, role = "", title
+        jobs.append({
+            "company": company.strip(), "role": role.strip(),
+            "location": "Remote", "link": normalize_link(link),
+        })
+    return jobs
+
+
+def fetch_usajobs():
+    if not USAJOBS_API_KEY:
+        return []  # skipped — see README for how to get a free key
+    jobs = []
+    for kw in USAJOBS_KEYWORDS:
+        url = "https://data.usajobs.gov/api/search"
+        headers = {
+            "Host": "data.usajobs.gov",
+            "User-Agent": USAJOBS_EMAIL or "newgrad-job-monitor",
+            "Authorization-Key": USAJOBS_API_KEY,
+        }
+        params = {"Keyword": kw, "WhoMayApply": "public", "ResultsPerPage": 100}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[warn] usajobs ({kw}): fetch failed: {e}", file=sys.stderr)
+            continue
+        for item in data.get("SearchResult", {}).get("SearchResultItems", []):
+            d = item.get("MatchedObjectDescriptor", {})
+            role = d.get("PositionTitle", "")
+            if not matches_new_grad(role):
+                continue
+            jobs.append({
+                "company": d.get("OrganizationName", "US Government"),
+                "role": role,
+                "location": d.get("PositionLocationDisplay", ""),
+                "link": normalize_link(d.get("PositionURI", "")),
+            })
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# State + Discord
+# ---------------------------------------------------------------------------
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -135,16 +341,13 @@ def post_to_discord(new_jobs, source_name):
     if not DISCORD_WEBHOOK_URL:
         print("[warn] DISCORD_WEBHOOK_URL not set, skipping Discord post")
         return
-    # Discord embeds: batch in groups of 10 (embed limit per message)
     for i in range(0, len(new_jobs), 10):
         batch = new_jobs[i:i + 10]
-        embeds = []
-        for job in batch:
-            embeds.append({
-                "title": f"{job['company']} — {job['role']}"[:256],
-                "url": job["link"],
-                "description": job["location"] or "Location not listed",
-            })
+        embeds = [{
+            "title": f"{job['company']} — {job['role']}"[:256],
+            "url": job["link"],
+            "description": job["location"] or "Location not listed",
+        } for job in batch]
         payload = {
             "content": f"**{len(new_jobs)} new posting(s)** from *{source_name}*" if i == 0 else None,
             "embeds": embeds,
@@ -153,7 +356,29 @@ def post_to_discord(new_jobs, source_name):
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
         if resp.status_code >= 300:
             print(f"[warn] discord post failed: {resp.status_code} {resp.text}", file=sys.stderr)
-        time.sleep(1)  # be polite to Discord rate limits
+        time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def build_sources():
+    """Returns list of (name, fetch_fn) pairs."""
+    sources = []
+    for s in GITHUB_TABLE_SOURCES:
+        sources.append((s["name"], lambda s=s: fetch_github_table(s)))
+    for slug in GREENHOUSE_COMPANIES:
+        sources.append((f"Greenhouse/{slug}", lambda slug=slug: fetch_greenhouse(slug)))
+    for slug in LEVER_COMPANIES:
+        sources.append((f"Lever/{slug}", lambda slug=slug: fetch_lever(slug)))
+    for slug in ASHBY_COMPANIES:
+        sources.append((f"Ashby/{slug}", lambda slug=slug: fetch_ashby(slug)))
+    sources.append(("RemoteOK", fetch_remoteok))
+    sources.append(("We Work Remotely", fetch_wwr_rss))
+    if USAJOBS_API_KEY:
+        sources.append(("USAJobs", fetch_usajobs))
+    return sources
 
 
 def main():
@@ -162,26 +387,22 @@ def main():
     is_first_run = len(seen) == 0
 
     all_new = []
-    for source in SOURCES:
-        jobs = fetch_source(source)
-        jobs = [j for j in jobs if passes_filters(j)]
-        new_jobs = [j for j in jobs if j["link"] not in seen]
-
+    for name, fetch_fn in build_sources():
+        jobs = fetch_fn()
+        new_jobs = [j for j in jobs if j["link"] and j["link"] not in seen]
         for j in new_jobs:
             seen.add(j["link"])
 
         if is_first_run:
-            # Don't spam Discord with hundreds of postings on the very first run —
-            # just establish the baseline silently.
-            print(f"[init] baseline: recorded {len(new_jobs)} existing postings from {source['name']}")
+            print(f"[init] baseline: recorded {len(new_jobs)} existing postings from {name}")
             continue
 
         if new_jobs:
-            print(f"[info] {len(new_jobs)} new posting(s) from {source['name']}")
-            post_to_discord(new_jobs, source["name"])
+            print(f"[info] {len(new_jobs)} new posting(s) from {name}")
+            post_to_discord(new_jobs, name)
             all_new.extend(new_jobs)
         else:
-            print(f"[info] no new postings from {source['name']}")
+            print(f"[info] no new postings from {name}")
 
     state["seen_links"] = sorted(seen)
     save_state(state)
