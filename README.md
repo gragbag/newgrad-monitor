@@ -27,8 +27,10 @@ Since the ATS/aggregator sources list *all* open roles, not just new-grad ones,
 `\b` word-boundary regexes rather than plain substrings, specifically so
 "software engineer I" doesn't also match inside "software engineer II" — this
 is inherently imperfect since titling conventions vary by company, so it's
-worth tuning both lists to taste. The three GitHub tracker repos don't need
-this since they're already curated to new-grad roles.
+worth tuning both lists to taste. The three GitHub tracker repos are already
+curated to new-grad roles, so they skip the `NEW_GRAD_PATTERNS` requirement,
+but `EXCLUDE_PATTERNS` still applies to them — some mid/senior/leveled roles
+slip into those lists too.
 
 ## How it works
 
@@ -38,10 +40,14 @@ this since they're already curated to new-grad roles.
   etc.) is marked `"status": "closed"` rather than deleted, so a job you
   already applied to stays visible on your board with a closed badge instead
   of quietly vanishing. If it comes back, it's reopened automatically.
-- Closed postings you never checked off as applied are pruned entirely after
-  `CLOSED_RETENTION_DAYS` (45 by default, in `monitor.py`) so `jobs.json`
-  doesn't grow forever. Anything present in `checkmarks.json` (i.e. you
-  applied) is kept regardless of age.
+- The same company + role posted by more than one source — common across the
+  three trackers, which overlap heavily — is deduped down to one row. The
+  duplicates aren't deleted, just closed out (see below), preferring whichever
+  copy you've already made a decision on, otherwise the one seen first.
+- Closed postings (delisted *or* deduped) with no decision recorded are pruned
+  entirely after `CLOSED_RETENTION_DAYS` (45 by default, in `monitor.py`) so
+  `jobs.json` doesn't grow forever. Anything present in `checkmarks.json` —
+  applied *or* dismissed — is kept regardless of age.
 - The **first run** just records a baseline silently (so you don't get spammed with
   hundreds of existing postings), and doesn't close anything on that run either.
 - A single company's ATS returning an error (404, migrated to a different ATS,
@@ -99,13 +105,25 @@ this since they're already curated to new-grad roles.
 ## The board (index.html)
 
 `index.html` is a static frontend — dark, dense, monospace — that reads `jobs.json`
-and lets you filter by source/status/listing, search, sort, and check off postings
-you've applied to. No build step, no framework.
+and lets you search, sort, and filter by status/listing/source-type/feed, marking
+each posting applied or not-interested as you triage. No build step, no framework.
+
+Each row has two buttons: a checkmark for **Applied** and an × for **Not
+interested** — mutually exclusive, click the active one again to undo. The
+**Status** filter (All / To review / Applied / Not interested) lets you narrow
+to whichever you're working through; "To review" is the useful one for
+triaging a big backlog, since it hides everything you've already decided on.
 
 The **Listing** filter controls closed postings (roles `monitor.py` no longer
-finds in their source): "Open (+ applied)" (the default) hides them unless
-you've already applied, "All" shows everything, "Closed only" isolates them.
-A closed posting still visible in a view carries a red "closed" badge.
+finds in their source, including ones closed out as duplicates): "Open (+
+applied)" (the default) hides them unless you've applied, "All" shows
+everything, "Closed only" isolates them. A closed posting still visible in a
+view carries a red "closed" badge.
+
+**Source** filters by broad category (Tracker/Greenhouse/Lever/...); **Feed**
+filters by the exact source (e.g. one specific tracker repo, or one company's
+ATS) — useful if one tracker is noisier than the others and you want to see
+its postings on their own, or exclude it entirely.
 
 **Setup:**
 
@@ -119,7 +137,7 @@ A closed posting still visible in a view carries a red "closed" badge.
 3. **Open the board**, click "GitHub sync settings" in the left rail, and enter your
    repo owner, repo name, branch (`main`), and the token. It's saved in your browser's
    localStorage and only sent directly to GitHub's API — never to any third party.
-4. Check off jobs as you apply. Changes auto-save to `checkmarks.json` in the repo
+4. Mark jobs applied/not-interested as you triage. Changes auto-save to `checkmarks.json` in the repo
    ~2 seconds after your last click (batched, so rapid-fire checking doesn't spam commits).
 
 **Notes on the token**: because it's stored in browser localStorage and used

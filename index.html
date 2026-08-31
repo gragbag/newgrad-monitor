@@ -104,6 +104,7 @@
   .search-input::placeholder { color: var(--slate-dim); }
 
   .chip-list { display: flex; flex-direction: column; gap: 6px; }
+  .chip-list.scroll { max-height: 190px; overflow-y: auto; padding-right: 4px; }
 
   .chip {
     display: flex;
@@ -183,6 +184,7 @@
   }
   .stat.applied .num { color: var(--sage); }
   .stat.remaining .num { color: var(--amber); }
+  .stat.dismissed .num { color: var(--slate); }
 
   .group { margin-bottom: 6px; }
   .group-header {
@@ -205,7 +207,7 @@
 
   .row {
     display: grid;
-    grid-template-columns: 28px 1fr auto auto 90px;
+    grid-template-columns: 42px 1fr auto auto 90px;
     gap: 14px;
     align-items: center;
     padding: 9px 4px;
@@ -215,6 +217,8 @@
   .row:hover { background: var(--board-2); }
   .row.applied { opacity: 0.55; }
   .row.applied .role { text-decoration: line-through; text-decoration-color: var(--sage-dim); }
+  .row.dismissed { opacity: 0.4; }
+  .row.dismissed .role { text-decoration: line-through; text-decoration-color: var(--slate-dim); }
   .row.closed:not(.applied) { opacity: 0.4; }
 
   .closed-badge {
@@ -227,15 +231,24 @@
     border-radius: 3px;
   }
 
-  @media (max-width: 640px) {
-    .row { grid-template-columns: 24px 1fr; row-gap: 4px; }
-    .row .location, .row .source, .row .date { grid-column: 2; font-size: 11px; }
+  .decision { display: flex; gap: 4px; }
+  .dec-btn {
+    width: 18px; height: 18px;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--slate-dim);
+    font-size: 11px;
+    line-height: 1;
+    padding: 0;
   }
+  .dec-btn:hover { border-color: var(--slate); color: var(--paper); }
+  .dec-btn.applied.active { background: var(--sage); border-color: var(--sage); color: var(--ink); }
+  .dec-btn.dismissed.active { background: #B5544B; border-color: #B5544B; color: var(--ink); }
 
-  .row input[type="checkbox"] {
-    width: 16px; height: 16px;
-    accent-color: var(--sage);
-    cursor: pointer;
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 42px 1fr; row-gap: 4px; }
+    .row .location, .row .source, .row .date { grid-column: 2; font-size: 11px; }
   }
 
   .role-cell .company {
@@ -318,6 +331,11 @@
     </div>
 
     <div class="filter-group">
+      <div class="label">Feed</div>
+      <div class="chip-list scroll" id="feedFilters"></div>
+    </div>
+
+    <div class="filter-group">
       <div class="label">Sort</div>
       <select class="search-input" id="sortSelect">
         <option value="newest">Newest first</option>
@@ -336,6 +354,7 @@
       <div class="stat"><div class="num" id="statTotal">–</div><div class="lbl">Tracked</div></div>
       <div class="stat applied"><div class="num" id="statApplied">–</div><div class="lbl">Applied</div></div>
       <div class="stat remaining"><div class="num" id="statRemaining">–</div><div class="lbl">Remaining</div></div>
+      <div class="stat dismissed"><div class="num" id="statDismissed">–</div><div class="lbl">Not interested</div></div>
     </div>
     <div id="board"></div>
   </div>
@@ -359,10 +378,10 @@
 (function () {
   const state = {
     jobs: [],
-    checkmarks: {},        // link -> true
+    checkmarks: {},        // link -> 'applied' | 'dismissed'
     checkmarksSha: null,
     cfg: JSON.parse(localStorage.getItem('manifest_cfg') || 'null'),
-    filters: { search: '', status: 'all', listing: 'open', sources: new Set(), sort: 'newest' },
+    filters: { search: '', status: 'all', listing: 'open', sources: new Set(), feeds: new Set(), sort: 'newest' },
     saveTimer: null,
   };
 
@@ -398,7 +417,11 @@
       const data = await res.json();
       state.checkmarksSha = data.sha;
       const decoded = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ''))));
-      state.checkmarks = JSON.parse(decoded || '{}');
+      const parsed = JSON.parse(decoded || '{}');
+      // legacy entries (from before "dismissed" existed) stored a bare `true`
+      state.checkmarks = Object.fromEntries(
+        Object.entries(parsed).map(([link, v]) => [link, v === true ? 'applied' : v])
+      );
       setSync('ok', 'synced');
     } catch (e) {
       console.error('Failed to load checkmarks', e);
@@ -424,8 +447,10 @@
     if (!state.cfg) return;
     setSync('pending', 'saving…');
     try {
+      const decisions = Object.values(state.checkmarks);
       const body = {
-        message: `Update checkmarks (${Object.keys(state.checkmarks).length} applied)`,
+        message: `Update checkmarks (${decisions.filter(v => v === 'applied').length} applied, `
+          + `${decisions.filter(v => v === 'dismissed').length} dismissed)`,
         content: btoa(unescape(encodeURIComponent(JSON.stringify(state.checkmarks, null, 2)))),
         branch: state.cfg.branch,
       };
@@ -456,7 +481,7 @@
 
   function buildFilterChips() {
     const statuses = [
-      ['all', 'All'], ['open', 'Not applied'], ['applied', 'Applied'],
+      ['all', 'All'], ['todo', 'To review'], ['applied', 'Applied'], ['dismissed', 'Not interested'],
     ];
     $('statusFilters').innerHTML = statuses.map(([val, label]) => `
       <label class="chip">
@@ -494,6 +519,24 @@
         else state.filters.sources.delete(inp.value);
         render();
       }));
+
+    const feeds = [...new Set(state.jobs.map(j => j.source))].sort();
+    if (state.filters.feeds.size === 0) feeds.forEach(f => state.filters.feeds.add(f));
+    $('feedFilters').innerHTML = feeds.map(f => {
+      const count = state.jobs.filter(j => j.source === f).length;
+      return `
+      <label class="chip">
+        <input type="checkbox" value="${escapeAttr(f)}" ${state.filters.feeds.has(f) ? 'checked' : ''}>
+        ${escapeHtml(f)}
+        <span class="count">${count}</span>
+      </label>`;
+    }).join('');
+    $('feedFilters').querySelectorAll('input').forEach(inp =>
+      inp.addEventListener('change', () => {
+        if (inp.checked) state.filters.feeds.add(inp.value);
+        else state.filters.feeds.delete(inp.value);
+        render();
+      }));
   }
 
   $('search').addEventListener('input', (e) => { state.filters.search = e.target.value.toLowerCase(); render(); });
@@ -508,13 +551,16 @@
     let visible = state.jobs.filter(j => {
       if (f.search && !(`${j.company} ${j.role}`.toLowerCase().includes(f.search))) return false;
       if (f.sources.size && !f.sources.has(j.source_type)) return false;
-      const applied = !!state.checkmarks[j.link];
-      if (f.status === 'open' && applied) return false;
-      if (f.status === 'applied' && !applied) return false;
+      if (f.feeds.size && !f.feeds.has(j.source)) return false;
+      const decision = state.checkmarks[j.link]; // undefined | 'applied' | 'dismissed'
+      if (f.status === 'todo' && decision) return false;
+      if (f.status === 'applied' && decision !== 'applied') return false;
+      if (f.status === 'dismissed' && decision !== 'dismissed') return false;
       const closed = j.status === 'closed';
-      // "open" listing view still shows closed jobs you've already applied to,
-      // so applying doesn't make a posting disappear from your tracking view
-      if (f.listing === 'open' && closed && !applied) return false;
+      // "open" listing view still shows closed jobs you've applied to, so
+      // applying doesn't make a posting disappear from your tracking view —
+      // dismissed jobs get no such carve-out, since you've said you don't care
+      if (f.listing === 'open' && closed && decision !== 'applied') return false;
       if (f.listing === 'closed' && !closed) return false;
       return true;
     });
@@ -526,10 +572,12 @@
     }
 
     const openJobs = state.jobs.filter(j => j.status !== 'closed');
-    const appliedCount = state.jobs.filter(j => state.checkmarks[j.link]).length;
+    const appliedCount = state.jobs.filter(j => state.checkmarks[j.link] === 'applied').length;
+    const dismissedCount = state.jobs.filter(j => state.checkmarks[j.link] === 'dismissed').length;
     $('statTotal').textContent = openJobs.length;
     $('statApplied').textContent = appliedCount;
     $('statRemaining').textContent = openJobs.filter(j => !state.checkmarks[j.link]).length;
+    $('statDismissed').textContent = dismissedCount;
 
     if (!visible.length) {
       $('board').innerHTML = '<div class="empty">Nothing matches these filters.</div>';
@@ -553,11 +601,12 @@
     }
     $('board').innerHTML = html;
 
-    $('board').querySelectorAll('input[type="checkbox"][data-link]').forEach(cb => {
-      cb.addEventListener('change', () => {
-        const link = cb.getAttribute('data-link');
-        if (cb.checked) state.checkmarks[link] = true;
-        else delete state.checkmarks[link];
+    $('board').querySelectorAll('.dec-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const link = btn.getAttribute('data-link');
+        const action = btn.getAttribute('data-action'); // 'applied' | 'dismissed'
+        if (state.checkmarks[link] === action) delete state.checkmarks[link]; // click active button again to undo
+        else state.checkmarks[link] = action;
         render();
         scheduleSave();
       });
@@ -565,12 +614,15 @@
   }
 
   function rowHtml(j) {
-    const applied = !!state.checkmarks[j.link];
+    const decision = state.checkmarks[j.link]; // undefined | 'applied' | 'dismissed'
     const closed = j.status === 'closed';
     const date = j.first_seen ? new Date(j.first_seen).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '';
     return `
-      <div class="row ${applied ? 'applied' : ''} ${closed ? 'closed' : ''}">
-        <input type="checkbox" data-link="${escapeAttr(j.link)}" ${applied ? 'checked' : ''}>
+      <div class="row ${decision === 'applied' ? 'applied' : ''} ${decision === 'dismissed' ? 'dismissed' : ''} ${closed ? 'closed' : ''}">
+        <div class="decision">
+          <button class="dec-btn applied ${decision === 'applied' ? 'active' : ''}" data-link="${escapeAttr(j.link)}" data-action="applied" title="Applied">&check;</button>
+          <button class="dec-btn dismissed ${decision === 'dismissed' ? 'active' : ''}" data-link="${escapeAttr(j.link)}" data-action="dismissed" title="Not interested">&times;</button>
+        </div>
         <div class="role-cell">
           <a class="apply-link" href="${escapeAttr(j.link)}" target="_blank" rel="noopener">
             <span class="company">${escapeHtml(j.company)}</span> — <span class="role">${escapeHtml(j.role)}</span>

@@ -15,8 +15,10 @@ Writes jobs.json: a full, browsable snapshot of every posting ever seen, with
 company/role/location/source/category/status/first_seen/last_seen/closed_at —
 this is the file the frontend (index.html) reads to render the board. Postings
 that drop out of a source's current listing are marked "closed" (not deleted)
-so applied-to jobs don't vanish from your board; closed postings you never
-applied to are pruned after CLOSED_RETENTION_DAYS.
+so applied/dismissed jobs don't vanish from your board; closed postings you
+haven't made a decision on are pruned after CLOSED_RETENTION_DAYS. The same
+company+role posted by more than one source (the three community trackers
+overlap a lot) is deduped down to one row, closing out the extras.
 """
 
 import json
@@ -24,14 +26,15 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 
 JOBS_FILE = "jobs.json"  # full browsable dataset, read by index.html
-CHECKMARKS_FILE = "checkmarks.json"  # written by index.html; read here so applied jobs are never pruned
-CLOSED_RETENTION_DAYS = 45  # how long a closed, never-applied posting stays visible before being dropped
+CHECKMARKS_FILE = "checkmarks.json"  # written by index.html: {link: "applied"|"dismissed"}
+CLOSED_RETENTION_DAYS = 45  # how long a closed posting (no decision recorded) stays before being dropped
 USAJOBS_API_KEY = os.environ.get("USAJOBS_API_KEY", "")
 USAJOBS_EMAIL = os.environ.get("USAJOBS_EMAIL", "")  # USAJobs wants your email as the User-Agent
 
@@ -375,9 +378,12 @@ def load_jobs():
     return {}
 
 
-def load_checkmarks():
-    """Returns the set of links marked applied in checkmarks.json (written by
-    index.html), so pruning never deletes a job the user has applied to."""
+def load_decided_links():
+    """Returns the set of links the user has made a decision on (applied or
+    dismissed) via checkmarks.json, written by index.html. Legacy entries from
+    before "dismissed" existed store a bare `true` rather than a status string;
+    either way, once a link is in here it's never auto-pruned or auto-deduped
+    away — the user has already looked at it."""
     if os.path.exists(CHECKMARKS_FILE):
         try:
             with open(CHECKMARKS_FILE, "r") as f:
@@ -385,6 +391,13 @@ def load_checkmarks():
         except Exception:
             return set()
     return set()
+
+
+def dedupe_key(job):
+    """Same company + same role text, case/whitespace-insensitive. Location is
+    deliberately excluded — the trackers format it inconsistently across
+    sources for what's usually the same underlying posting."""
+    return (job.get("company", "").strip().lower(), job.get("role", "").strip().lower())
 
 
 def save_jobs(jobs_by_link):
@@ -423,11 +436,15 @@ def build_sources():
 
 def main():
     jobs_by_link = load_jobs()
-    applied_links = load_checkmarks()
+    protected_links = load_decided_links()  # applied or dismissed — never pruned/deduped away
     is_first_run = len(jobs_by_link) == 0
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    total_new = total_closed = total_reopened = 0
+    # dedupe against jobs already open, tracked across the whole run so two
+    # sources introducing the same company+role in the same run only keep one
+    open_keys = {dedupe_key(j) for j in jobs_by_link.values() if j.get("status", "open") == "open"}
+
+    total_new = total_closed = total_reopened = total_dupes = 0
 
     for name, source_type, category, fetch_fn in build_sources():
         fetched = fetch_fn()
@@ -438,12 +455,16 @@ def main():
 
         current_links = {j["link"] for j in fetched if j["link"]}
 
-        new_count = reopened_count = 0
+        new_count = reopened_count = dupe_count = 0
         for j in fetched:
             if not j["link"]:
                 continue
             existing = jobs_by_link.get(j["link"])
             if existing is None:
+                key = dedupe_key(j)
+                if key in open_keys:
+                    dupe_count += 1  # same company+role already open under another link/source
+                    continue
                 jobs_by_link[j["link"]] = {
                     **j,
                     "source": name,
@@ -451,18 +472,26 @@ def main():
                     "category": category,
                     "status": "open",
                     "closed_at": None,
+                    "closed_reason": None,
                     "first_seen": now_iso,
                     "last_seen": now_iso,
                 }
+                open_keys.add(key)
                 new_count += 1
             else:
                 existing["last_seen"] = now_iso
-                was_closed = existing.get("status") == "closed"
-                if existing.get("status") != "open":
+                if existing.get("closed_reason") == "duplicate":
+                    # deliberately suppressed in favor of a canonical row elsewhere;
+                    # its source still listing it isn't a signal to reopen it —
+                    # the dedupe pass below re-evaluates the whole group each run
+                    pass
+                elif existing.get("status") != "open":
                     # covers both reopening a closed posting and backfilling
                     # "status" on records written before this field existed
+                    was_closed = existing.get("status") == "closed"
                     existing["status"] = "open"
                     existing["closed_at"] = None
+                    existing["closed_reason"] = None
                     if was_closed:
                         reopened_count += 1
 
@@ -473,28 +502,54 @@ def main():
                         and job["link"] not in current_links):
                     job["status"] = "closed"
                     job["closed_at"] = now_iso
+                    job["closed_reason"] = "delisted"
                     closed_count += 1
 
         total_new += new_count
         total_closed += closed_count
         total_reopened += reopened_count
+        total_dupes += dupe_count
 
         if is_first_run:
             print(f"[init] baseline: recorded {len(current_links)} existing postings from {name}")
-        elif new_count or closed_count or reopened_count:
-            print(f"[info] {name}: {new_count} new, {closed_count} closed, {reopened_count} reopened")
+        elif new_count or closed_count or reopened_count or dupe_count:
+            print(f"[info] {name}: {new_count} new, {closed_count} closed, "
+                  f"{reopened_count} reopened, {dupe_count} duplicate")
         else:
             print(f"[info] {name}: no changes")
 
-    # Drop postings that have been closed for a while and were never applied to,
-    # so jobs.json doesn't grow forever. Anything in checkmarks.json is kept regardless.
+    # Existing duplicates (rows that predate this dedupe logic, or that both
+    # showed up for the first time in the same run before the loop above could
+    # cross-reference them) — collapse each group down to one canonical row.
+    # Prefer whichever the user already made a decision on; otherwise the oldest.
+    dupe_groups = defaultdict(list)
+    for link, job in jobs_by_link.items():
+        if job.get("status", "open") == "open":
+            dupe_groups[dedupe_key(job)].append(link)
+
+    total_deduped = 0
+    for links in dupe_groups.values():
+        if len(links) <= 1:
+            continue
+        decided = [l for l in links if l in protected_links]
+        canonical = decided[0] if decided else min(links, key=lambda l: jobs_by_link[l]["first_seen"])
+        for link in links:
+            if link == canonical:
+                continue
+            jobs_by_link[link]["status"] = "closed"
+            jobs_by_link[link]["closed_at"] = now_iso
+            jobs_by_link[link]["closed_reason"] = "duplicate"
+            total_deduped += 1
+
+    # Drop postings that have been closed for a while with no decision recorded,
+    # so jobs.json doesn't grow forever. Applied/dismissed links are kept regardless.
     cutoff_ts = datetime.now(timezone.utc).timestamp() - CLOSED_RETENTION_DAYS * 86400
     stale_links = [
         link for link, job in jobs_by_link.items()
         if job.get("status") == "closed"
         and job.get("closed_at")
         and datetime.fromisoformat(job["closed_at"]).timestamp() < cutoff_ts
-        and link not in applied_links
+        and link not in protected_links
     ]
     for link in stale_links:
         del jobs_by_link[link]
@@ -505,7 +560,8 @@ def main():
         print("Baseline established. Future runs will report new postings, closures, and reopenings.")
     else:
         print(f"Done. {total_new} new, {total_closed} newly closed, {total_reopened} reopened, "
-              f"{len(stale_links)} pruned (closed >{CLOSED_RETENTION_DAYS}d, never applied). "
+              f"{total_dupes} duplicate (skipped), {total_deduped} deduped (closed), "
+              f"{len(stale_links)} pruned (closed >{CLOSED_RETENTION_DAYS}d, no decision). "
               f"{len(jobs_by_link)} total tracked.")
 
 
